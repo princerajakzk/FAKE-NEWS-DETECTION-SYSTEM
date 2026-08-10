@@ -11,3 +11,7 @@ pillow
 lxml_html_clean
 flask-limiter
 requests
+
+gunicorn
+
+gunicorn
