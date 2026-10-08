@@ -389,7 +389,7 @@ def check_gemini_ai(text: str, internet_sources: list = None) -> dict:
     configured_model = os.environ.get("GEMINI_MODEL", "").strip()
     if configured_model:
         models_to_try.append(configured_model)
-    for default_m in ["gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-flash-latest", "gemini-flash-lite-latest"]:
+    for default_m in ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-latest"]:
         if default_m not in models_to_try:
             models_to_try.append(default_m)
 
@@ -409,10 +409,10 @@ Live Internet & Media Context (Found in real-time internet search):
 {sources_summary}
 
 Verification Guidelines:
-1. "Real": The statement represents a genuine real-world event, confirmed official news, historical fact, scientific fact, or true development.
-2. "Fake": The statement is fabricated, a hoax, rumor, scam, conspiracy theory, satire, debunked viral misinformation, or medical falsehood.
-3. If internet search results or fact-checkers show that this claim is debunked or false, classify as "Fake".
-4. If mainstream reputable media report it as an active genuine event, classify as "Real".
+1. "Real": The statement represents a genuine real-world event, confirmed official development, ongoing public issue, or active news reported by legitimate mainstream news organizations (e.g. protests, policy decisions, market movements, court rulings, elections).
+   - IMPORTANT: If mainstream reputable media report the core event as genuine, classify as "Real". If there is an unconfirmed detail or rumor attached to a real event, explain what is confirmed vs unverified in "actual_truth", but do NOT falsely label genuine real-world news as Fake!
+2. "Fake": The statement is a fabricated hoax, conspiracy theory, scam, satirical fabrication, medical falsehood, or debunked viral misinfo where the core event itself never occurred.
+3. If trusted fact-checkers (AltNews, Snopes, Boom, PIB Fact Check, PolitiFact, Reuters Fact Check) have actively debunked this specific claim as false/fabricated, classify as "Fake".
 
 Respond STRICTLY in valid JSON format:
 {{
@@ -429,7 +429,7 @@ Respond STRICTLY in valid JSON format:
     for model in models_to_try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}"
         try:
-            resp = http_requests.post(url, json=payload, timeout=8.0)
+            resp = http_requests.post(url, json=payload, timeout=6.5)
             if resp.status_code == 200:
                 data = resp.json()
                 raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -581,33 +581,44 @@ def combine_verdict(ai_label: str, ai_confidence: float, net_verify: dict, fact_
                 reasons.append(f"Local linguistic model tone check: Stylistic anomalies detected ({ai_confidence}% confidence)")
 
     # ── Final Verdict Determination
-    if gemini_active and gemini_result.get("verdict") in ("Real", "Fake"):
-        # Gemini AI verdict with world knowledge & semantic fact-checking
-        if gemini_result["verdict"] == "Real":
-            final_label = "Real"
-            bonus = 3.0 if (net_verify and net_verify.get("has_confirmation")) else 0.0
-            final_confidence = min(99.0, max(float(gemini_result["confidence"]), 92.0 + bonus))
-        elif gemini_result["verdict"] == "Fake":
-            final_label = "Fake"
-            final_confidence = min(99.0, max(float(gemini_result["confidence"]), 92.0))
-        else:
-            final_label = "Fake" if score < 0 else "Real"
-            final_confidence = min(99.0, max(float(gemini_result["confidence"]), 85.0))
-    elif net_verify and net_verify.get("has_debunk"):
+    # Case 1: Active Fact-Check Debunk Registry Hit -> Definitively FAKE
+    if net_verify and net_verify.get("has_debunk"):
         final_label = "Fake"
         final_confidence = 96.0
-    elif net_verify and net_verify.get("has_confirmation"):
+
+    # Case 2: Multi-Source Live Mainstream News Confirmation -> Definitively REAL!
+    elif net_verify and net_verify.get("has_confirmation") and not net_verify.get("has_debunk"):
         final_label = "Real"
-        final_confidence = min(98.0, max(88.0, 78.0 + net_verify.get("count", 1) * 3))
+        match_count = net_verify.get("count", 1)
+        final_confidence = min(99.0, max(92.0, 85.0 + match_count * 3))
+
+    # Case 3: Gemini AI semantic reasoning & knowledge
+    elif gemini_active and gemini_result.get("verdict") in ("Real", "Fake"):
+        g_verdict = gemini_result["verdict"]
+        g_conf = float(gemini_result.get("confidence", 92.0))
+        # If internet search matched multiple active news articles, prioritize Real
+        if net_verify and net_verify.get("matched") and net_verify.get("count", 0) >= 2 and not net_verify.get("has_debunk"):
+            final_label = "Real"
+            final_confidence = max(88.0, g_conf)
+        else:
+            final_label = g_verdict
+            final_confidence = min(99.0, max(g_conf, 90.0))
+
     elif score >= 15:
         final_label = "Real"
-        final_confidence = round(min(95.0, 72.0 + score * 0.3), 1)
+        final_confidence = round(min(95.0, 75.0 + score * 0.3), 1)
     elif score <= -15:
         final_label = "Fake"
-        final_confidence = round(min(95.0, 70.0 + abs(score) * 0.35), 1)
+        final_confidence = round(min(95.0, 75.0 + abs(score) * 0.35), 1)
     else:
-        final_label = "Real" if ai_label == "Real" else "Fake"
-        final_confidence = round(max(50.0, min(80.0, float(ai_confidence))), 1)
+        # Neutral fallback: Don't falsely brand neutral news as Fake
+        s_chk = sensationalism_score(text) if (text and "sensationalism_score" in globals()) else 0
+        if s_chk < 25:
+            final_label = "Real"
+            final_confidence = 80.0
+        else:
+            final_label = "Real" if ai_label == "Real" else "Fake"
+            final_confidence = round(max(50.0, min(80.0, float(ai_confidence))), 1)
 
     actual_truth = ""
     proof = ""

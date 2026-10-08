@@ -224,11 +224,11 @@ def _full_analyze(text: str, source_url: str = None) -> dict:
         f_net = executor.submit(verify_on_internet, text)
         f_fc  = executor.submit(check_fact_database, text)
         try:
-            net_verify = f_net.result(timeout=4.5) or net_verify
+            net_verify = f_net.result(timeout=6.5) or net_verify
         except Exception as e:
             print(f"[TruthLine] net_verify error: {e}")
         try:
-            fact_check = f_fc.result(timeout=3.5) or fact_check
+            fact_check = f_fc.result(timeout=4.5) or fact_check
         except Exception:
             pass
 
@@ -493,7 +493,7 @@ def predict():
         "full_text":      text[:3000],
         "label":          result["label"],
         "confidence":     result["confidence"],
-        "model_used":     _mname,
+        "model_used":     result.get("model_used", _mname),
         "sensationalism": result["sensationalism"],
         "readability":    result["readability"],
         "credibility":    result["credibility"]["level"] if result["credibility"] else None,
