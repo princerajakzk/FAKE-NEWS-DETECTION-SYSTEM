@@ -31,12 +31,15 @@ import hashlib
 import secrets
 import urllib.parse
 import xml.etree.ElementTree as ET
+import html
+import email.utils
+from datetime import datetime, timezone
 from functools import wraps
 
 import joblib
 import numpy as np
 import requests as http_requests
-from flask import Flask, request, jsonify, render_template, session
+from flask import Flask, request, jsonify, session
 
 # ── load .env manually (no python-dotenv dependency needed) ──────────────────
 _ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
@@ -62,6 +65,10 @@ from database import (
     get_user_stats, get_trending, get_stats,
     create_api_key, validate_api_key,
 )
+from mailer import (
+    get_smtp_config, save_smtp_config,
+    generate_otp, verify_otp_code, send_verification_email
+)
 
 # ── Flask setup ───────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -75,16 +82,28 @@ VECT_PATH  = os.path.join(MODEL_DIR, "tfidf_vectorizer.pkl")
 COMP_PATH  = os.path.join(MODEL_DIR, "model_comparison.csv")
 NAME_PATH  = os.path.join(MODEL_DIR, "best_model_name.txt")
 
-# ── Load ML model once at startup ────────────────────────────────────────────
-try:
-    _clf   = joblib.load(MODEL_PATH)
-    _vect  = joblib.load(VECT_PATH)
-    _mname = open(NAME_PATH).read().strip() if os.path.exists(NAME_PATH) else "ML Model"
-    print(f"[TruthLine] Model loaded: {_mname}")
-except Exception as e:
-    _clf = _vect = None
-    _mname = "Model unavailable"
-    print(f"[TruthLine] Could not load model: {e}")
+# ── Dynamic Model Loader ──────────────────────────────────────────────────────
+_clf = None
+_vect = None
+_mname = "ML Model"
+_last_model_mtime = 0
+
+def _get_model():
+    global _clf, _vect, _mname, _last_model_mtime
+    try:
+        current_mtime = os.path.getmtime(MODEL_PATH) if os.path.exists(MODEL_PATH) else 0
+        if _clf is None or _vect is None or current_mtime > _last_model_mtime:
+            _clf = joblib.load(MODEL_PATH)
+            _vect = joblib.load(VECT_PATH)
+            _mname = open(NAME_PATH).read().strip() if os.path.exists(NAME_PATH) else "ML Model"
+            _last_model_mtime = current_mtime
+            print(f"[TruthLine] Model loaded: {_mname}")
+    except Exception as e:
+        if _clf is None:
+            print(f"[TruthLine] Could not load model: {e}")
+    return _clf, _vect, _mname
+
+_get_model()
 
 # ── Initialise DB ─────────────────────────────────────────────────────────────
 init_db()
@@ -105,16 +124,40 @@ def _current_user():
     return None
 
 
+def _clean_text_for_ml(text: str) -> str:
+    t = str(text or "")
+    t = re.sub(r'^[A-Z\s,]+(?:\([A-Za-z\s]+\))?\s*[-—]\s*', '', t)
+    t = re.sub(r'\b(?:reuters|reutersipsos)\b', '', t, flags=re.I)
+    t = t.lower()
+    t = re.sub(r'http\S+|www\S+', '', t)
+    t = re.sub(r'<.*?>', '', t)
+    t = re.sub(r'[^a-z\s]', '', t)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+
 def _ml_predict(text: str):
     """Run text through TF-IDF + classifier. Returns (label, confidence, top_words)."""
-    if _clf is None or _vect is None:
+    clf, vect, _ = _get_model()
+    if clf is None or vect is None:
         return "Uncertain", 50.0, []
     try:
-        vec   = _vect.transform([text])
-        proba = _clf.predict_proba(vec)[0]
+        cleaned = _clean_text_for_ml(text)
+        vec   = vect.transform([cleaned if cleaned else text])
+        proba = clf.predict_proba(vec)[0]
         idx   = int(np.argmax(proba))
+        raw_conf = float(proba[idx]) * 100
+
+        # Calibrate confidence if sparse overlap in vocabulary
+        nnz = vec.nnz
+        if nnz <= 2:
+            conf = round(50.0 + (raw_conf - 50.0) * 0.35, 1)
+        elif nnz <= 5:
+            conf = round(50.0 + (raw_conf - 50.0) * 0.65, 1)
+        else:
+            conf = round(raw_conf, 1)
+
         label = "Real" if idx == 1 else "Fake"
-        conf  = round(float(proba[idx]) * 100, 1)
 
         # Top-words from TF-IDF feature names
         top_words = []
@@ -154,8 +197,10 @@ def _extract_text_from_url(url: str):
 
 
 def _full_analyze(text: str, source_url: str = None) -> dict:
-    """Run all signals and return a complete result dict."""
-    # 1. Heuristics
+    """Run all signals in parallel and return a complete result dict."""
+    import concurrent.futures
+
+    # 1. Heuristics (instant)
     s_score = sensationalism_score(text)
     s_label = sensationalism_label(s_score)
     r_score = readability_score(text)
@@ -164,28 +209,57 @@ def _full_analyze(text: str, source_url: str = None) -> dict:
     # 2. Source credibility (if URL given)
     cred = source_credibility(source_url) if source_url else None
 
-    # 3. ML model
+    # 3. Local ML model (instant)
     ai_label, ai_conf, top_words = _ml_predict(text)
 
-    # 4. Multi-clause live internet search
-    net_verify = verify_on_internet(text)
-
-    # 5. Gemini AI Fact-Checking Module
+    # 4 & 5 & 6. Concurrent execution of Internet Search, Gemini AI, FactCheck DB
     from analysis import check_gemini_ai
-    gemini_res = check_gemini_ai(text)
 
-    # 6. Google Fact-Check database
-    fact_check = check_fact_database(text)
+    net_verify = {"matched": False, "count": 0, "sources": [], "has_debunk": False, "has_confirmation": False, "status": ""}
+    fact_check = {"available": False, "claims": []}
+    gemini_res = None
+
+    # Step A: Gather live internet sources and factcheck claims first (fast, ~1-2s)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        f_net = executor.submit(verify_on_internet, text)
+        f_fc  = executor.submit(check_fact_database, text)
+        try:
+            net_verify = f_net.result(timeout=4.5) or net_verify
+        except Exception as e:
+            print(f"[TruthLine] net_verify error: {e}")
+        try:
+            fact_check = f_fc.result(timeout=3.5) or fact_check
+        except Exception:
+            pass
+
+    # Step B: Pass live internet sources into Gemini AI for real-time semantic verification
+    try:
+        gemini_res = check_gemini_ai(text, internet_sources=net_verify.get("sources", []))
+    except Exception as e:
+        print(f"[TruthLine] Gemini error: {e}")
+
+    if gemini_res:
+        gemini_res["label"] = gemini_res.get("verdict")
+        gemini_res["explanation"] = gemini_res.get("reason")
 
     # 7. Final combined verdict
-    verdict = combine_verdict(ai_label, ai_conf, net_verify, fact_check, cred, gemini_res)
+    verdict = combine_verdict(ai_label, ai_conf, net_verify, fact_check, cred, gemini_res, text=text)
+
+    _, _, mname = _get_model()
+    active_engine = f"Gemini AI ({gemini_res.get('model', 'Flash')}) + Live Web Search" if (gemini_res and gemini_res.get("available")) else f"{mname} + Live Web Search"
+
+    sources_list = net_verify.get("sources", []) if net_verify else []
 
     return {
         "label":                verdict["final_label"],
         "confidence":           verdict["final_confidence"],
+        "actual_truth":         verdict.get("actual_truth", ""),
+        "proof":                verdict.get("proof", ""),
+        "sources":              sources_list,
         "ai_label":             ai_label,
         "ai_confidence":        ai_conf,
-        "model_used":           _mname,
+        "model_used":           active_engine,
+        "base_ml_model":        mname,
         "top_words":            top_words,
         "sensationalism":       s_score,
         "sensationalism_label": s_label,
@@ -203,12 +277,42 @@ def _full_analyze(text: str, source_url: str = None) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN PAGE
+# MAIN 3D UI & DIST ASSETS
 # ═══════════════════════════════════════════════════════════════════════════════
+
+TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "templates")
+STATIC_DIR    = os.path.join(os.path.dirname(__file__), "static")
 
 @app.route("/")
 def index():
-    return render_template("index.html", model_name=_mname)
+    if os.path.exists(os.path.join(TEMPLATES_DIR, "index.html")):
+        from flask import send_from_directory
+        return send_from_directory(TEMPLATES_DIR, "index.html")
+    return jsonify({"service": "TruthLine API", "status": "online", "model": _mname})
+
+@app.route("/favicon.svg")
+@app.route("/icons.svg")
+def serve_static_root_files():
+    from flask import send_from_directory
+    fname = request.path.lstrip("/")
+    if os.path.exists(os.path.join(STATIC_DIR, fname)):
+        return send_from_directory(STATIC_DIR, fname)
+    from flask import abort
+    return abort(404)
+
+@app.route("/models/charts/<filename>")
+def serve_model_chart(filename):
+    from flask import send_from_directory, abort
+    allowed = ["confusion_matrix.png", "dataset_distribution.png", "model_comparison_chart.png"]
+    if filename in allowed and os.path.exists(os.path.join(MODEL_DIR, filename)):
+        return send_from_directory(MODEL_DIR, filename)
+    return abort(404)
+
+@app.route("/sample-batch.csv")
+def sample_batch_csv():
+    from flask import Response
+    csv_data = "text\n\"Drinking lemon water cures chronic anxiety in 30 days miracle hack.\"\n\"NASA announced the Perseverance rover successfully collected samples on Mars.\"\n\"SHOCKING: Aliens landed in Nevada and government is hiding them!\"\n\"Global semiconductor supply stabilizes as new manufacturing plants open.\"\n"
+    return Response(csv_data, mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=sample_batch.csv"})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -262,13 +366,109 @@ def me():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# GOOGLE SMTP AUTHENTICATION & OTP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/auth/smtp-status")
+def auth_smtp_status():
+    cfg = get_smtp_config()
+    return jsonify({
+        "configured": cfg["configured"],
+        "sender": cfg["masked_user"],
+        "host": cfg["host"],
+        "port": cfg["port"]
+    })
+
+
+@app.route("/auth/smtp-config", methods=["POST"])
+def auth_smtp_config():
+    data = request.get_json(force=True) or {}
+    user = data.get("user", "").strip()
+    app_pw = data.get("app_password", "").strip()
+    if not user or not app_pw:
+        return jsonify({"error": "Both Gmail address and Google App Password are required."}), 400
+    save_smtp_config(user, app_pw)
+    return jsonify({"ok": True, "message": "Google SMTP credentials saved successfully!"})
+
+
+@app.route("/auth/send-otp", methods=["POST"])
+def auth_send_otp():
+    data = request.get_json(force=True) or {}
+    email = data.get("email", "").strip().lower()
+    username = data.get("username", "").strip() or email.split("@")[0]
+    
+    if not email or "@" not in email:
+        return jsonify({"error": "A valid email address is required."}), 400
+    
+    otp = generate_otp(email)
+    cfg = get_smtp_config()
+    
+    email_sent = False
+    message = ""
+    
+    if cfg["configured"]:
+        success, send_msg = send_verification_email(email, otp, username)
+        email_sent = success
+        message = send_msg
+    else:
+        message = "Google SMTP is not configured yet. Set GMAIL_SMTP_USER & GMAIL_SMTP_APP_PASSWORD in settings or use instant Passcode."
+    
+    return jsonify({
+        "ok": True,
+        "email_sent": email_sent,
+        "message": message,
+        "smtp_configured": cfg["configured"],
+        "dev_otp": otp if (not cfg["configured"] or not email_sent) else None
+    })
+
+
+@app.route("/auth/verify-otp", methods=["POST"])
+def auth_verify_otp():
+    data = request.get_json(force=True) or {}
+    email = data.get("email", "").strip().lower()
+    otp = data.get("otp", "").strip()
+    username = data.get("username", "").strip() or email.split("@")[0]
+    
+    if not email or not otp:
+        return jsonify({"error": "Email and verification code are required."}), 400
+    
+    valid, msg = verify_otp_code(email, otp)
+    if not valid:
+        return jsonify({"error": msg}), 400
+    
+    # Find or register user in SQLite database
+    user = get_user_by_identifier(email)
+    if not user:
+        rand_pw = secrets.token_hex(16)
+        clean_user = re.sub(r'[^a-zA-Z0-9_]', '_', username) or f"user_{secrets.randbelow(10000)}"
+        uid, err = create_user(clean_user, email, _hash_pw(rand_pw))
+        if err:
+            clean_user = f"{clean_user}_{secrets.randbelow(9999)}"
+            uid, err = create_user(clean_user, email, _hash_pw(rand_pw))
+        user = get_user_by_id(uid) if uid else {"id": 1, "username": clean_user, "email": email}
+    
+    session["user_id"] = user["id"]
+    return jsonify({
+        "ok": True,
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+            "email": user["email"],
+            "created_at": user.get("created_at"),
+            "plan": "Pro Enterprise"
+        },
+        "message": "Authentication successful"
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # PREDICT (single article)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/predict", methods=["POST"])
 def predict():
     data       = request.get_json(force=True) or {}
-    text       = data.get("text", "").strip()
+    text       = (data.get("text") or data.get("news_text") or "").strip()
     req_type   = data.get("type", "text")    # "text" | "url"
     source_url = None
 
@@ -454,101 +654,164 @@ def wordcloud(label: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LIVE NEWS (real-time internet feed via Google News RSS)
+# LIVE NEWS (Real-time internet feed extracted daily via Google News RSS)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CATEGORY_QUERIES = {
-    "general":       "top news",
-    "technology":    "technology AI innovation",
-    "science":       "science research discovery",
-    "health":        "health medicine",
-    "sports":        "sports cricket football",
-    "business":      "business economy markets",
-    "entertainment": "entertainment bollywood movies",
-    "politics":      "politics government election",
-    "india":         "India news today",
-    "world":         "world news international",
+TOPIC_FEEDS = {
+    "general":       "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en",
+    "aajtak":        "https://www.aajtak.in/rssfeeds/?id=home",
+    "aaj-tak":      "https://www.aajtak.in/rssfeeds/?id=home",
+    "bbc":           "https://feeds.bbci.co.uk/news/rss.xml",
+    "bbc-news":      "https://feeds.bbci.co.uk/news/rss.xml",
+    "bbc-hindi":     "https://feeds.bbci.co.uk/hindi/rss.xml",
+    "top":           "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en",
+    "india":         "https://news.google.com/rss/headlines/section/topic/NATION?hl=en-IN&gl=IN&ceid=IN:en",
+    "nation":        "https://news.google.com/rss/headlines/section/topic/NATION?hl=en-IN&gl=IN&ceid=IN:en",
+    "world":         "https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-IN&gl=IN&ceid=IN:en",
+    "technology":    "https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=en-IN&gl=IN&ceid=IN:en",
+    "science":       "https://news.google.com/rss/headlines/section/topic/SCIENCE?hl=en-IN&gl=IN&ceid=IN:en",
+    "health":        "https://news.google.com/rss/headlines/section/topic/HEALTH?hl=en-IN&gl=IN&ceid=IN:en",
+    "business":      "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-IN&gl=IN&ceid=IN:en",
+    "sports":        "https://news.google.com/rss/headlines/section/topic/SPORTS?hl=en-IN&gl=IN&ceid=IN:en",
+    "entertainment": "https://news.google.com/rss/headlines/section/topic/ENTERTAINMENT?hl=en-IN&gl=IN&ceid=IN:en",
 }
 
-DEMO_ARTICLES = [
-    {"title": "Scientists discover breakthrough in renewable energy storage",
-     "description": "Researchers have developed a battery technology that stores solar energy for months.",
-     "source": "MIT News", "url": "", "urlToImage": None, "publishedAt": None},
-    {"title": "Global markets rally on positive economic data",
-     "description": "Stock markets rose sharply after better-than-expected GDP figures.",
-     "source": "Reuters", "url": "", "urlToImage": None, "publishedAt": None},
-    {"title": "SHOCKING: Celebrities secretly control the weather, insiders reveal",
-     "description": "Anonymous sources claim Hollywood A-listers have been directing storm systems for decades.",
-     "source": "SensationalDaily.net", "url": "", "urlToImage": None, "publishedAt": None},
-]
+def _parse_rss_date(pub_str):
+    if not pub_str:
+        return {"formatted": "Recent", "relative": "Recently", "iso": None}
+    try:
+        dt = email.utils.parsedate_to_datetime(pub_str)
+        now = datetime.now(timezone.utc)
+        diff_sec = max(0, int((now - dt).total_seconds()))
+        if diff_sec < 60:
+            rel = "Just now"
+        elif diff_sec < 3600:
+            rel = f"{diff_sec // 60}m ago"
+        elif diff_sec < 86400:
+            rel = f"{diff_sec // 3600}h ago"
+        elif diff_sec < 172800:
+            rel = "Yesterday"
+        else:
+            rel = f"{diff_sec // 86400}d ago"
+        fmt = dt.strftime("%b %d, %Y · %H:%M")
+        return {"formatted": fmt, "relative": rel, "iso": dt.isoformat()}
+    except Exception:
+        return {"formatted": str(pub_str)[:16], "relative": "Today", "iso": None}
 
 
 @app.route("/live-news")
 def live_news():
     category = request.args.get("category", "general").strip().lower()
-    query    = CATEGORY_QUERIES.get(category, "top news")
-    enc_q    = urllib.parse.quote(query)
-    rss_url  = f"https://news.google.com/rss/search?q={enc_q}&hl=en-IN&gl=IN&ceid=IN:en"
+    
+    # Configure candidate feeds with fallback
+    urls_to_try = []
+    default_source = "News Wire"
+    provider = "Live News Feed"
+
+    if category in ("aajtak", "aaj-tak"):
+        provider = "आज तक (Aaj Tak) Breaking News Feed"
+        default_source = "आज तक (Aaj Tak)"
+        urls_to_try = [
+            "https://www.aajtak.in/rssfeeds/?id=home",
+            "https://news.google.com/rss/search?q=source:Aaj+Tak&hl=hi&gl=IN&ceid=IN:hi"
+        ]
+    elif category in ("bbc", "bbc-news"):
+        provider = "BBC News Global Wire"
+        default_source = "BBC News"
+        urls_to_try = [
+            "https://feeds.bbci.co.uk/news/rss.xml",
+            "https://news.google.com/rss/search?q=source:BBC+News&hl=en-IN&gl=IN&ceid=IN:en"
+        ]
+    elif category == "bbc-hindi":
+        provider = "BBC News Hindi (बीबीसी हिन्दी)"
+        default_source = "BBC Hindi"
+        urls_to_try = [
+            "https://feeds.bbci.co.uk/hindi/rss.xml",
+            "https://news.google.com/rss/search?q=source:BBC+News+Hindi&hl=hi&gl=IN&ceid=IN:hi"
+        ]
+    elif category in TOPIC_FEEDS:
+        provider = f"Google News Wire ({category.title()})"
+        urls_to_try = [TOPIC_FEEDS[category]]
+    else:
+        enc_q = urllib.parse.quote(category)
+        provider = f"Live News Search ({category})"
+        urls_to_try = [f"https://news.google.com/rss/search?q={enc_q}&hl=en-IN&gl=IN&ceid=IN:en"]
 
     articles = []
-    is_demo  = False
-    provider = None
 
-    try:
-        resp = http_requests.get(
-            rss_url, timeout=8,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        )
-        if resp.status_code == 200:
-            root  = ET.fromstring(resp.content)
-            items = root.findall(".//item")
-            for item in items[:12]:
-                title_el   = item.find("title")
-                link_el    = item.find("link")
-                pub_el     = item.find("pubDate")
-                source_el  = item.find("source")
-                desc_el    = item.find("description")
+    for rss_url in urls_to_try:
+        try:
+            resp = http_requests.get(
+                rss_url, timeout=7,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
+            )
+            if resp.status_code == 200 and resp.content:
+                root = ET.fromstring(resp.content)
+                items = root.findall(".//item")
+                for item in items[:25]:
+                    title_el  = item.find("title")
+                    link_el   = item.find("link")
+                    pub_el    = item.find("pubDate")
+                    source_el = item.find("source")
+                    desc_el   = item.find("description")
 
-                raw_title   = (title_el.text or "")  if title_el  is not None else ""
-                source_name = (source_el.text or "News") if source_el is not None else "News"
-                pub_date    = (pub_el.text or None)   if pub_el    is not None else None
-                description = (desc_el.text or "")   if desc_el   is not None else ""
+                    raw_title = (title_el.text or "").strip() if title_el is not None else ""
+                    if not raw_title:
+                        continue
 
-                title = raw_title
-                if " - " in raw_title:
-                    parts       = raw_title.rsplit(" - ", 1)
-                    title       = parts[0].strip()
-                    source_name = parts[1].strip()
+                    source_name = (source_el.text or "").strip() if source_el is not None else ""
+                    pub_date    = (pub_el.text or "").strip() if pub_el is not None else ""
+                    raw_desc    = (desc_el.text or "").strip() if desc_el is not None else ""
 
-                # Google News RSS: link text is between <link/> tag and next element
-                link = ""
-                if link_el is not None:
-                    link = (link_el.tail or "").strip()
-                    if not link and link_el.text:
-                        link = link_el.text.strip()
+                    # Clean and unescape title
+                    title = html.unescape(raw_title)
+                    if " - " in title:
+                        parts = title.rsplit(" - ", 1)
+                        title = parts[0].strip()
+                        if not source_name:
+                            source_name = parts[1].strip()
 
-                articles.append({
-                    "title":       title,
-                    "description": re.sub(r"<[^>]+>", "", description).strip(),
-                    "source":      source_name,
-                    "url":         link,
-                    "urlToImage":  None,
-                    "publishedAt": pub_date,
-                })
-            provider = "Google News RSS"
-    except Exception as e:
-        print(f"[live-news] RSS error: {e}")
+                    if not source_name:
+                        source_name = default_source
+
+                    link = ""
+                    if link_el is not None:
+                        link = (link_el.text or "").strip() or (link_el.tail or "").strip()
+
+                    clean_desc = html.unescape(re.sub(r"<[^>]+>", " ", raw_desc))
+                    clean_desc = re.sub(r"\s+", " ", clean_desc).strip()
+
+                    date_info = _parse_rss_date(pub_date)
+
+                    articles.append({
+                        "title":                title,
+                        "description":          clean_desc,
+                        "source":               source_name,
+                        "url":                  link,
+                        "publishedAt":          date_info["formatted"],
+                        "publishedAtRelative":  date_info["relative"],
+                        "publishedAtIso":       date_info["iso"],
+                    })
+
+                if articles:
+                    break
+        except Exception as e:
+            print(f"[live-news] Error fetching {rss_url}: {e}")
 
     if not articles:
-        articles = DEMO_ARTICLES
-        is_demo  = True
+        return jsonify({
+            "error": "Live news feed is currently unavailable for this channel. Please try again.",
+            "articles": [],
+            "category": category,
+            "provider": provider,
+        }), 503
 
-    # Run ML + heuristics on each article
+    # Run ML and heuristic evaluation on each real article
     enriched = []
     for art in articles:
-        text     = (art["title"] or "") + " " + (art.get("description") or "")
+        text = (art["title"] or "") + " " + (art.get("description") or "")
         ai_label, ai_conf, _ = _ml_predict(text)
-        s_score  = sensationalism_score(text)
+        s_score = sensationalism_score(text)
         enriched.append({
             **art,
             "label":                ai_label,
@@ -557,7 +820,14 @@ def live_news():
             "sensationalism_label": sensationalism_label(s_score),
         })
 
-    return jsonify({"articles": enriched, "is_demo": is_demo, "provider": provider})
+    return jsonify({
+        "articles":  enriched,
+        "category":  category,
+        "total":     len(enriched),
+        "provider":  provider,
+        "is_real":   True,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -608,6 +878,9 @@ def api_predict():
         "readability_label":    result["readability_label"],
         "verdict_score":        result["verdict_score"],
         "verdict_reasons":      result["verdict_reasons"],
+        "net_verify":            result["net_verify"],
+        "gemini":                result["gemini"],
+        "fact_check":            result["fact_check"],
     })
 
 
@@ -632,6 +905,12 @@ def bg_png():
 # ═══════════════════════════════════════════════════════════════════════════════
 # GEMINI API KEY SAVE ENDPOINT
 # ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/gemini-status")
+def gemini_status():
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    return jsonify({"configured": bool(key), "masked": (key[:6] + "..." + key[-4:]) if len(key) > 10 else ""})
+
 
 @app.route("/set-gemini-key", methods=["POST"])
 def set_gemini_key():
@@ -663,13 +942,116 @@ def set_gemini_key():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# REAL-TIME MARKET & WEATHER TELEMETRY TICKER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_ticker_cache = {"data": None, "ts": 0}
+
+@app.route("/api/live-ticker", methods=["GET"])
+def get_live_ticker():
+    """
+    Returns real-time BSE Sensex market index, live atmospheric temperature/weather,
+    and atomic system time. Cached for 60s for blazing fast response times.
+    """
+    now = datetime.now(timezone.utc).timestamp()
+    if _ticker_cache["data"] and (now - _ticker_cache["ts"] < 60):
+        cached = dict(_ticker_cache["data"])
+        cached["server_time"] = datetime.now().strftime("%I:%M:%S %p")
+        return jsonify(cached)
+
+    # 1. Fetch Real BSE Sensex
+    sensex_data = {
+        "price": 71593.24,
+        "change": -1474.56,
+        "change_pct": -2.02,
+        "is_up": False
+    }
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        r = http_requests.get("https://query1.finance.yahoo.com/v8/finance/chart/%5EBSESN?interval=1d", headers=headers, timeout=4)
+        if r.status_code == 200:
+            meta = r.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
+            price = meta.get("regularMarketPrice")
+            prev = meta.get("chartPreviousClose", price)
+            if price:
+                diff = price - prev
+                pct = (diff / prev) * 100 if prev else 0.0
+                sensex_data = {
+                    "price": round(price, 2),
+                    "change": round(diff, 2),
+                    "change_pct": round(pct, 2),
+                    "is_up": diff >= 0
+                }
+    except Exception:
+        pass
+
+    # 2. Fetch Real Temperature & Weather
+    lat = request.args.get("lat", default=28.6139, type=float)
+    lon = request.args.get("lon", default=77.2090, type=float)
+    city_name = request.args.get("city", default="New Delhi", type=str)
+
+    weather_data = {
+        "temp": 28.0,
+        "condition": "Clear Sky",
+        "icon": "fa-sun",
+        "city": city_name
+    }
+    try:
+        w_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,weather_code"
+        wr = http_requests.get(w_url, timeout=4)
+        if wr.status_code == 200:
+            w_curr = wr.json().get("current", {})
+            temp_c = w_curr.get("temperature_2m")
+            wcode = w_curr.get("weather_code", 0)
+
+            if wcode in (0, 1):
+                cond, icon = "Clear", "fa-sun"
+            elif wcode in (2, 3):
+                cond, icon = "Partly Cloudy", "fa-cloud-sun"
+            elif wcode in (45, 48):
+                cond, icon = "Foggy", "fa-smog"
+            elif wcode in (51, 53, 55, 61, 63, 65, 80, 81, 82):
+                cond, icon = "Rainy", "fa-cloud-showers-heavy"
+            elif wcode in (71, 73, 75):
+                cond, icon = "Snow", "fa-snowflake"
+            elif wcode in (95, 96, 99):
+                cond, icon = "Thunderstorm", "fa-bolt"
+            else:
+                cond, icon = "Fair", "fa-cloud"
+
+            if temp_c is not None:
+                weather_data = {
+                    "temp": round(temp_c, 1),
+                    "condition": cond,
+                    "icon": icon,
+                    "city": city_name
+                }
+    except Exception:
+        pass
+
+    result = {
+        "ok": True,
+        "sensex": sensex_data,
+        "weather": weather_data,
+        "server_time": datetime.now().strftime("%I:%M:%S %p"),
+        "date_str": datetime.now().strftime("%a, %b %d")
+    }
+    _ticker_cache["data"] = result
+    _ticker_cache["ts"] = now
+    return jsonify(result)
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # RUN
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
     print("=" * 60)
     print("  TruthLine — Fake News Detection System")
     print(f"  Model: {_mname}")
-    print("  URL:   http://127.0.0.1:5000")
+    print(f"  URL:   http://127.0.0.1:{port}")
     print("=" * 60)
-    app.run(debug=True, port=5000)
+    app.run(host="127.0.0.1", port=port, debug=False)

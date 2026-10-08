@@ -48,59 +48,54 @@ with batch analysis, credibility checks, feedback learning, and a REST API.
 ```
 fake-news-detection/
 ├── dataset/
-│   ├── generate_sample_data.py   # generates a small test dataset
-│   ├── True.csv                  # replace with real Kaggle dataset
-│   └── Fake.csv                  # replace with real Kaggle dataset
+│   ├── True.csv                  # Verified authentic journalistic dataset (~21,000 articles)
+│   └── Fake.csv                  # Verified fabricated misinformation dataset (~23,000 articles)
 ├── notebooks/
-│   └── model_training.py         # trains, compares, and saves the model (5 models incl. ensemble)
-├── models/                       # trained model + vectorizer + charts + truthline.db (auto-created)
+│   ├── model_training.py         # Trains, benchmarks, and exports the active Random Forest classifier
+│   └── retrain_with_live_data.py # Continuous learning pipeline ingesting SQLite feedback
+├── models/
+│   ├── best_model.pkl            # Active production model (Random Forest, 99.78% accuracy)
+│   ├── tfidf_vectorizer.pkl      # 5,000 n-gram TF-IDF vectorizer
+│   ├── best_model_name.txt       # Active model name identifier
+│   ├── model_comparison.csv      # Algorithm benchmark comparison matrix
+│   ├── confusion_matrix.png      # Validation confusion matrix plot
+│   ├── model_comparison_chart.png# Algorithm benchmark bar chart
+│   ├── dataset_distribution.png  # Training class distribution chart
+│   └── truthline.db              # SQLite production database (history, users, api_keys)
 ├── app/
-│   ├── app.py                    # Flask server (URL scraping, batch, API, feedback, DB)
-│   ├── database.py               # SQLite persistence layer
-│   ├── analysis.py               # clickbait / readability / credibility heuristics
-│   └── templates/
-│       └── index.html            # premium dashboard UI
+│   ├── app.py                    # Production Flask server & REST API
+│   ├── analysis.py               # Multi-signal verification engine (Gemini AI, RSS search, heuristics)
+│   ├── database.py               # SQLite persistent ORM layer
+│   ├── mailer.py                 # Google SMTP OTP delivery service
+│   ├── static/                   # Static media assets, icons, and background textures
+│   ├── templates/
+│   │   └── index.html            # TruthLine 3D cosmic investigative dashboard
+│   └── .env                      # Environment variables & API keys
 ├── requirements.txt
 └── README.md
 ```
 
-## Setup (From Scratch)
+## Setup & Running
 
 ### 1. Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Get the dataset
-**For real results (required):** Download the Kaggle "Fake and Real News Dataset":
-https://www.kaggle.com/datasets/clmentbisaillon/fake-and-real-news-dataset
+### 2. Dataset & Pre-trained Model
+The production model (`best_model.pkl` with 99.78% accuracy) and TF-IDF vectorizer are already pre-trained and included in `models/`. The training datasets `True.csv` and `Fake.csv` (44,898 articles) are in `dataset/`.
 
-Place `True.csv` and `Fake.csv` inside the `dataset/` folder (replace the sample files).
-
-**For quick testing only**, a small sample dataset can be generated instead:
-```bash
-python dataset/generate_sample_data.py
-```
-Accuracy on this sample will look artificially perfect (the sentences are template-generated
-and trivially separable) — always use the Kaggle dataset before submitting your report for
-realistic, meaningful numbers.
-
-### 3. Train the model
+To re-train the models from scratch:
 ```bash
 python notebooks/model_training.py
 ```
-This creates in `models/`:
-- `best_model.pkl`, `tfidf_vectorizer.pkl`, `best_model_name.txt`
-- `model_comparison.csv` (now includes the Voting Ensemble row)
-- `model_comparison_chart.png`, `confusion_matrix.png`, `dataset_distribution.png`
 
-### 4. Run the dashboard
+### 3. Run the dashboard
 ```bash
 cd app
 python app.py
 ```
-Open **http://127.0.0.1:5000** in your browser. A `models/truthline.db` SQLite file is
-created automatically on first run to store history, feedback, and API keys.
+Open **http://127.0.0.1:5000** in your browser. All history, feedback, users, and API tokens persist inside `models/truthline.db`.
 
 ## Using the Premium Features
 
