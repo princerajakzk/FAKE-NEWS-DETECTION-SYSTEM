@@ -1430,6 +1430,53 @@ function updateTelemetryWings(mode, data = {}) {
 }
 
 /* ═════════════════════════════════════════════════════════════════════════════
+   HELPER: EXTRACT DOMAIN & LOGO FOR NEWS SOURCES
+   ═════════════════════════════════════════════════════════════════════════════ */
+function getSourceDomain(sourceName, url) {
+  if (!sourceName) return 'google.com';
+  const s = sourceName.toLowerCase();
+  if (s.includes('hindu')) return 'thehindu.com';
+  if (s.includes('new indian express')) return 'newindianexpress.com';
+  if (s.includes('indian express')) return 'indianexpress.com';
+  if (s.includes('india today')) return 'indiatoday.in';
+  if (s.includes('hindustan times')) return 'hindustantimes.com';
+  if (s.includes('ndtv')) return 'ndtv.com';
+  if (s.includes('reuters')) return 'reuters.com';
+  if (s.includes('bbc')) return 'bbc.com';
+  if (s.includes('altnews') || s.includes('alt news')) return 'altnews.in';
+  if (s.includes('boom')) return 'boomlive.in';
+  if (s.includes('snopes')) return 'snopes.com';
+  if (s.includes('times of india')) return 'timesofindia.indiatimes.com';
+  if (s.includes('livemint') || s.includes('mint')) return 'livemint.com';
+  if (s.includes('news18')) return 'news18.com';
+  if (s.includes('ani')) return 'aninews.in';
+  if (s.includes('pti')) return 'ptinews.com';
+  if (s.includes('national herald')) return 'nationalheraldindia.com';
+  if (s.includes('deccan herald')) return 'deccanherald.com';
+  if (s.includes('cnn')) return 'cnn.com';
+  if (s.includes('bloomberg')) return 'bloomberg.com';
+  if (s.includes('al jazeera')) return 'aljazeera.com';
+  if (s.includes('guardian')) return 'theguardian.com';
+  if (s.includes('pib')) return 'pib.gov.in';
+  if (s.includes('financial express')) return 'financialexpress.com';
+  if (s.includes('economic times')) return 'economictimes.indiatimes.com';
+  if (s.includes('zee')) return 'zeenews.india.com';
+  if (s.includes('aaj tak') || s.includes('aajtak')) return 'aajtak.in';
+  if (s.includes('abp')) return 'abplive.com';
+  if (s.includes('politifact')) return 'politifact.com';
+
+  try {
+    const u = new URL(url);
+    if (!u.hostname.includes('google.com') && !u.hostname.includes('localhost')) {
+      return u.hostname;
+    }
+  } catch(_) {}
+
+  const clean = s.replace(/[^a-z0-9]/g, '');
+  return clean ? `${clean}.com` : 'google.com';
+}
+
+/* ═════════════════════════════════════════════════════════════════════════════
    CORE ENGINE: LIVE AI ANALYSIS (/predict)
    ═════════════════════════════════════════════════════════════════════════════ */
 async function analyzeContent(){
@@ -1569,45 +1616,93 @@ async function analyzeContent(){
         const icon = label === 'real' 
           ? 'fa-solid fa-circle-check text-emerald-400' 
           : (label === 'fake' ? 'fa-solid fa-circle-xmark text-rose-400' : 'fa-solid fa-circle-half-stroke text-amber-400');
-        findings.push([icon, r]);
+        findings.push({ type: 'finding', icon: icon, text: r });
       });
     }
 
     if(data.actual_truth && (!data.verdict_reasons || !data.verdict_reasons.includes(data.actual_truth))){
-      findings.push(['fa-solid fa-lightbulb text-cyan-300', 'Actual Truth: ' + data.actual_truth]);
+      findings.push({ type: 'finding', icon: 'fa-solid fa-lightbulb text-cyan-300', text: 'Actual Truth: ' + data.actual_truth });
     }
 
     if(data.proof && (!data.verdict_reasons || !data.verdict_reasons.includes(data.proof))){
-      findings.push(['fa-solid fa-file-shield text-violet-300', 'Evidence: ' + data.proof]);
+      findings.push({ type: 'finding', icon: 'fa-solid fa-file-shield text-violet-300', text: 'Evidence: ' + data.proof });
     }
 
+    // Media & Fact-Check Sources with official website logos and names
     if(data.sources && Array.isArray(data.sources) && data.sources.length > 0){
-      data.sources.slice(0, 3).forEach(s => {
-        const title = s.title || s.url || 'News Source';
-        const url = s.url ? `<a href="${s.url}" target="_blank" rel="noopener" class="underline text-cyan-300 hover:text-cyan-200 ml-1">${title}</a>` : title;
-        const icon = s.has_debunk ? 'fa-solid fa-ban text-rose-400' : (s.has_confirmation ? 'fa-solid fa-check-double text-emerald-400' : 'fa-solid fa-link text-cyan-400');
-        findings.push([icon, `Source citation: ${url}`]);
+      data.sources.slice(0, 4).forEach(s => {
+        const sourceName = s.source || 'News Source';
+        const title = s.title || s.url || 'News Source Coverage';
+        const url = s.url || '#';
+        const domain = getSourceDomain(sourceName, url);
+        const isDebunk = !!s.has_debunk || !!s.is_fact_check;
+        const isConfirm = !!s.has_confirmation || (!isDebunk && label === 'real');
+
+        findings.push({
+          type: 'source',
+          sourceName: sourceName,
+          domain: domain,
+          title: title,
+          url: url,
+          isDebunk: isDebunk,
+          isConfirm: isConfirm
+        });
       });
     }
 
     if(data.model_used){
       $('findings-model-tag').textContent = `Engine: ${data.model_used}`;
-      findings.push(['fa-solid fa-microchip text-slate-400', `Detection Engine: ${data.model_used}`]);
+      findings.push({ type: 'finding', icon: 'fa-solid fa-microchip text-slate-400', text: `Detection Engine: ${data.model_used}` });
     }
 
     if(findings.length === 0){
       if(label === 'real'){
-        findings.push(['fa-solid fa-circle-check text-emerald-400', 'Passed multi-point wire verification & linguistic credibility metrics']);
+        findings.push({ type: 'finding', icon: 'fa-solid fa-circle-check text-emerald-400', text: 'Passed multi-point wire verification & linguistic credibility metrics' });
       } else {
-        findings.push(['fa-solid fa-triangle-exclamation text-rose-400', 'Linguistic markers and lack of corroborated reporting trigger fabrication flags']);
+        findings.push({ type: 'finding', icon: 'fa-solid fa-triangle-exclamation text-rose-400', text: 'Linguistic markers and lack of corroborated reporting trigger fabrication flags' });
       }
     }
 
     const ul = $('findings-list');
-    ul.innerHTML = findings.map(f => `
-      <li class="flex gap-3.5 glass rounded-2xl p-4 sm:p-4.5 items-start">
-        <i class="${f[0]} mt-0.5 text-base shrink-0"></i><span class="text-slate-200 text-xs sm:text-sm leading-relaxed">${f[1]}</span>
-      </li>`).join('');
+    ul.innerHTML = findings.map(f => {
+      if(f.type === 'source') {
+        const badgeCls = f.isDebunk 
+          ? 'bg-rose-500/15 text-rose-300 border-rose-500/30' 
+          : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30';
+        const badgeText = f.isDebunk ? 'Fact-Check Debunk' : 'Verified Media Source';
+        const badgeIcon = f.isDebunk ? 'fa-solid fa-triangle-exclamation text-rose-400' : 'fa-solid fa-check text-emerald-400';
+
+        return `
+        <li class="flex gap-3.5 glass rounded-2xl p-4 sm:p-4.5 items-start border border-slate-800/80 hover:border-cyan-500/40 transition-all group/src">
+          <div class="w-9 h-9 rounded-xl bg-slate-900/90 border border-slate-700/80 flex items-center justify-center p-1.5 shrink-0 overflow-hidden shadow-sm shadow-black/50 group-hover/src:border-cyan-400/50 transition-colors">
+            <img src="https://www.google.com/s2/favicons?domain=${f.domain}&sz=64" 
+                 alt="${f.sourceName}" 
+                 class="w-5 h-5 object-contain rounded" 
+                 loading="lazy"
+                 onerror="this.onerror=null; this.src='https://icons.duckduckgo.com/ip3/${f.domain}.ico';" />
+          </div>
+          <div class="flex flex-col gap-1 w-full min-w-0">
+            <div class="flex items-center gap-2 flex-wrap">
+              <span class="text-xs sm:text-sm font-bold text-white font-display tracking-tight">${f.sourceName}</span>
+              <span class="text-[9px] font-mono px-2 py-0.5 rounded-full border ${badgeCls} flex items-center gap-1">
+                <i class="${badgeIcon} text-[8px]"></i>
+                ${badgeText}
+              </span>
+            </div>
+            <a href="${f.url}" target="_blank" rel="noopener noreferrer" class="text-xs text-slate-300 hover:text-cyan-200 transition-colors leading-relaxed line-clamp-2 mt-0.5 flex items-start gap-1.5 group">
+              <span class="font-normal text-slate-200 group-hover:text-cyan-200">"${f.title}"</span>
+              <i class="fa-solid fa-arrow-up-right-from-square text-[9px] text-cyan-400/70 group-hover:text-cyan-300 mt-1 shrink-0"></i>
+            </a>
+          </div>
+        </li>`;
+      } else {
+        return `
+        <li class="flex gap-3.5 glass rounded-2xl p-4 sm:p-4.5 items-start">
+          <i class="${f.icon} mt-0.5 text-base shrink-0"></i>
+          <span class="text-slate-200 text-xs sm:text-sm leading-relaxed">${f.text}</span>
+        </li>`;
+      }
+    }).join('');
 
     $('findings-wrap').classList.remove('hidden');
     showToast(`Analysis complete · ${truthScore}% truth score`);
